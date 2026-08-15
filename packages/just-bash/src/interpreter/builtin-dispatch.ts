@@ -915,6 +915,7 @@ export async function executeExternalCommand(
   );
 
   try {
+    ctx.onCommandDispatch?.();
     const runCommand = (): Promise<ExecResult> =>
       awaitWithDefenseContext(
         ctx.requireDefenseContext,

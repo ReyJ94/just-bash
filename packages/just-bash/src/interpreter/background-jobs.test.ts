@@ -27,6 +27,35 @@ async function waitUntil(
 }
 
 describe("virtual background jobs", () => {
+  it("enters background command callbacks in shell source order", async () => {
+    const release = deferred();
+    const entered: string[] = [];
+    const bash = new Bash({
+      defenseInDepth: false,
+      customCommands: [
+        defineCommand("voice", async ([operation]) => {
+          entered.push(operation ?? "");
+          if (operation === "say") await release.promise;
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }),
+      ],
+    });
+
+    const execution = bash.exec(
+      'voice say "first" & voice say "second" & voice status & wait',
+    );
+    try {
+      await waitUntil(
+        () => entered.length === 3,
+        "all background callbacks did not start",
+      );
+      expect(entered).toEqual(["say", "say", "status"]);
+    } finally {
+      release.resolve();
+    }
+    await execution;
+  });
+
   it("starts independent jobs concurrently and drains them before exec returns", async () => {
     const releases = new Map<string, Deferred>([
       ["one", deferred()],

@@ -473,6 +473,8 @@ export interface InterpreterContext {
   executionScope: ExecutionScope;
   /** Interpreter-local virtual background-job lifecycle owner. */
   backgroundJobs?: BackgroundJobController;
+  /** Signals that the first runtime command in a newly launched job is entering dispatch. */
+  onCommandDispatch?: () => void;
   execFn: (
     script: string,
     options?: InterpreterExecOptions,

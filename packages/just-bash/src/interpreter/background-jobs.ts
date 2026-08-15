@@ -26,6 +26,7 @@ export class BackgroundJobController {
   private readonly completionQueue: JobOutcome[] = [];
   private activeJobs = 0;
   private completionSequence = 0;
+  private dispatchTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly executionScope: ExecutionScope,
@@ -33,7 +34,9 @@ export class BackgroundJobController {
     private readonly allocatePid: () => number,
   ) {}
 
-  launch(run: (pid: number) => Promise<ExecResult>): number {
+  launch(
+    run: (pid: number, signalDispatched: () => void) => Promise<ExecResult>,
+  ): number {
     if (this.activeJobs >= this.maxConcurrentJobs) {
       const error = new ExecutionLimitError(
         `maximum concurrent background jobs exceeded (${this.maxConcurrentJobs})`,
@@ -45,9 +48,22 @@ export class BackgroundJobController {
 
     const pid = this.allocatePid();
     this.activeJobs++;
+    const previousDispatch = this.dispatchTail;
+    let dispatched = false;
+    let signalDispatched!: () => void;
+    this.dispatchTail = new Promise<void>((resolve) => {
+      signalDispatched = () => {
+        if (dispatched) return;
+        dispatched = true;
+        resolve();
+      };
+    });
+    // @banned-pattern-ignore: static internal fields only, never populated by user-controlled keys
     const job = {} as BackgroundJob;
     const completion = Promise.resolve()
-      .then(() => run(pid))
+      .then(() => previousDispatch)
+      .then(() => run(pid, signalDispatched))
+      .finally(signalDispatched)
       .then(
         (result): JobOutcome => ({
           pid,

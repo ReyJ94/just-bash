@@ -159,6 +159,8 @@ export interface InterpreterOptions {
   jsBootstrapCode?: string;
   /** Tool invoker hook for js-exec's `tools` proxy */
   invokeTool?: ToolInvoker;
+  /** Internal launch barrier for source-ordered background command dispatch. */
+  onCommandDispatch?: () => void;
 }
 
 export class Interpreter {
@@ -178,6 +180,7 @@ export class Interpreter {
       limits: options.limits,
       executionScope: options.executionScope,
       backgroundJobs,
+      onCommandDispatch: options.onCommandDispatch,
       execFn: options.exec,
       executeScript: this.executeScript.bind(this),
       executeStatement: this.executeStatement.bind(this),
@@ -478,44 +481,48 @@ export class Interpreter {
 
   private launchBackgroundStatement(node: StatementNode): ExecResult {
     const childState = cloneIsolatedShellState(this.ctx.state);
-    const pid = backgroundJobsOrThrow(this.ctx).launch(async (jobPid) => {
-      childState.bashPid = jobPid;
-      childState.lastBackgroundPid = 0;
-      const child = new Interpreter(
-        {
-          fs: this.ctx.fs,
-          commands: this.ctx.commands,
-          limits: this.ctx.limits,
-          executionScope: this.ctx.executionScope,
-          exec: this.ctx.execFn,
-          fetch: this.ctx.fetch,
-          sleep: this.ctx.sleep,
-          trace: this.ctx.trace,
-          coverage: this.ctx.coverage,
-          requireDefenseContext: this.ctx.requireDefenseContext,
-          jsBootstrapCode: this.ctx.jsBootstrapCode,
-          invokeTool: this.ctx.invokeTool,
-        },
-        childState,
-      );
-      try {
-        return await child.executeScript({
-          type: "Script",
-          statements: [{ ...node, background: false }],
-        });
-      } catch (error) {
-        if (error instanceof ExitError) {
-          return {
-            stdout: error.stdout,
-            stderr: error.stderr,
-            exitCode: error.exitCode,
-            internalOutputAccounting: error.internalOutputAccounting,
-            env: mapToRecord(childState.env),
-          };
+    const pid = backgroundJobsOrThrow(this.ctx).launch(
+      async (jobPid, signalDispatched) => {
+        childState.bashPid = jobPid;
+        childState.lastBackgroundPid = 0;
+        // @banned-pattern-ignore: background child reuses the parent executionScope and execFn
+        const child = new Interpreter(
+          {
+            fs: this.ctx.fs,
+            commands: this.ctx.commands,
+            limits: this.ctx.limits,
+            executionScope: this.ctx.executionScope,
+            exec: this.ctx.execFn,
+            fetch: this.ctx.fetch,
+            sleep: this.ctx.sleep,
+            trace: this.ctx.trace,
+            coverage: this.ctx.coverage,
+            requireDefenseContext: this.ctx.requireDefenseContext,
+            jsBootstrapCode: this.ctx.jsBootstrapCode,
+            invokeTool: this.ctx.invokeTool,
+            onCommandDispatch: signalDispatched,
+          },
+          childState,
+        );
+        try {
+          return await child.executeScript({
+            type: "Script",
+            statements: [{ ...node, background: false }],
+          });
+        } catch (error) {
+          if (error instanceof ExitError) {
+            return {
+              stdout: error.stdout,
+              stderr: error.stderr,
+              exitCode: error.exitCode,
+              internalOutputAccounting: error.internalOutputAccounting,
+              env: mapToRecord(childState.env),
+            };
+          }
+          throw error;
         }
-        throw error;
-      }
-    });
+      },
+    );
     this.ctx.state.lastBackgroundPid = pid;
     this.ctx.state.lastExitCode = 0;
     this.ctx.state.env.set("?", "0");
