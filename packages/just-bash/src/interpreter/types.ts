@@ -17,8 +17,10 @@ import type {
   CommandRegistry,
   ExecResult,
   FeatureCoverageWriter,
+  ToolInvoker,
   TraceCallback,
 } from "../types.js";
+import type { BackgroundJobController } from "./background-jobs.js";
 import type { ProcessSubstitutionEntry } from "./process-substitution.js";
 
 export type InterpreterExecOptions = Omit<CommandExecOptions, "cwd"> & {
@@ -291,6 +293,8 @@ export interface ProcessState {
   bashPid: number;
   /** Counter for generating unique virtual PIDs for subshells */
   nextVirtualPid: number;
+  /** Shared allocator retained by isolated concurrent shell-state copies. */
+  virtualPidAllocator?: { next: number };
   /** Virtual main shell PID for $$ (default 1, never exposes real process.pid) */
   virtualPid: number;
   /** Virtual parent PID for $PPID (default 0, never exposes real process.ppid) */
@@ -467,6 +471,8 @@ export interface InterpreterContext {
   limits: Required<ExecutionLimits>;
   /** Shared security accounting for this top-level execution and descendants. */
   executionScope: ExecutionScope;
+  /** Interpreter-local virtual background-job lifecycle owner. */
+  backgroundJobs?: BackgroundJobController;
   execFn: (
     script: string,
     options?: InterpreterExecOptions,
@@ -509,5 +515,5 @@ export interface InterpreterContext {
    * Tool invoker hook. When present, js-exec sets up a `tools` proxy that
    * routes calls through this callback.
    */
-  invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  invokeTool?: ToolInvoker;
 }

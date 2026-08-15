@@ -84,6 +84,11 @@ export class ExecutionScope {
     this.poisoned ??= error;
   }
 
+  /** Permanently reject sibling work after a shared execution limit fails. */
+  poisonAfterLimit(error: ExecutionLimitError): void {
+    this.poisoned ??= error;
+  }
+
   private assertUsable(): void {
     if (this.poisoned) throw this.poisoned;
     if (this.closed) {

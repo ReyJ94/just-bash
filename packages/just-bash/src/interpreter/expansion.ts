@@ -94,6 +94,7 @@ import { isNameref, resolveNameref } from "./helpers/nameref.js";
 import { getLiteralValue, isQuotedPart } from "./helpers/word-parts.js";
 import { openProcessSubstitution } from "./process-substitution.js";
 import type { InterpreterContext } from "./types.js";
+import { allocateVirtualPid } from "./virtual-process.js";
 
 // Re-export extracted functions for use elsewhere
 export { escapeGlobChars, escapeRegexChars } from "./expansion/glob-escape.js";
@@ -806,7 +807,7 @@ async function expandPart(
 
       // Command substitutions get a new BASHPID (unlike $$ which stays the same)
       const savedBashPid = ctx.state.bashPid;
-      ctx.state.bashPid = ctx.state.nextVirtualPid++;
+      ctx.state.bashPid = allocateVirtualPid(ctx.state);
       // Save environment - command substitutions run in a subshell and should not
       // modify parent environment (e.g., aliases defined inside $() should not leak)
       const savedEnv = new Map(ctx.state.env);

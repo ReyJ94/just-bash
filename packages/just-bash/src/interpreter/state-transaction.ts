@@ -80,6 +80,75 @@ function cloneLocalVarStack(
 }
 
 /**
+ * Produce a shell-namespace copy that can execute concurrently with its
+ * parent. Host capabilities, execution accounting, and the virtual PID
+ * allocator live outside (or are deliberately shared through) this state.
+ */
+export function cloneIsolatedShellState(
+  state: InterpreterState,
+): InterpreterState {
+  return {
+    ...state,
+    env: new Map(state.env),
+    arrays: cloneArrays(state.arrays),
+    options: { ...state.options },
+    shoptOptions: { ...state.shoptOptions },
+    fileDescriptors: state.fileDescriptors
+      ? new Map(state.fileDescriptors)
+      : undefined,
+    inputFds: state.inputFds ? new Set(state.inputFds) : undefined,
+    fdAliases: cloneFdAliases(state.fdAliases),
+    closedStandardFds: state.closedStandardFds
+      ? new Set(state.closedStandardFds)
+      : undefined,
+    processSubstitutions: state.processSubstitutions
+      ? [...state.processSubstitutions]
+      : undefined,
+    readonlyVars: new Set(state.readonlyVars),
+    associativeArrays: new Set(state.associativeArrays),
+    namerefs: new Set(state.namerefs),
+    boundNamerefs: new Set(state.boundNamerefs),
+    invalidNamerefs: new Set(state.invalidNamerefs),
+    integerVars: new Set(state.integerVars),
+    lowercaseVars: new Set(state.lowercaseVars),
+    uppercaseVars: new Set(state.uppercaseVars),
+    exportedVars: new Set(state.exportedVars),
+    tempExportedVars: new Set(state.tempExportedVars),
+    localExportedVars: state.localExportedVars?.map((vars) => new Set(vars)),
+    declaredVars: new Set(state.declaredVars),
+    localScopes: state.localScopes.map((scope) => new Map(scope)),
+    localArrayScopes: cloneLocalArrayScopes(state.localArrayScopes),
+    localVarDepth: state.localVarDepth
+      ? new Map(state.localVarDepth)
+      : undefined,
+    localVarStack: cloneLocalVarStack(state.localVarStack),
+    fullyUnsetLocals: state.fullyUnsetLocals
+      ? new Map(state.fullyUnsetLocals)
+      : undefined,
+    tempEnvBindings: state.tempEnvBindings?.map(
+      (bindings) => new Map(bindings),
+    ),
+    mutatedTempEnvVars: state.mutatedTempEnvVars
+      ? new Set(state.mutatedTempEnvVars)
+      : undefined,
+    accessedTempEnvVars: state.accessedTempEnvVars
+      ? new Set(state.accessedTempEnvVars)
+      : undefined,
+    functions: new Map(state.functions),
+    callLineStack: state.callLineStack ? [...state.callLineStack] : undefined,
+    funcNameStack: state.funcNameStack ? [...state.funcNameStack] : undefined,
+    sourceStack: state.sourceStack ? [...state.sourceStack] : undefined,
+    directoryStack: state.directoryStack
+      ? [...state.directoryStack]
+      : undefined,
+    hashTable: state.hashTable ? new Map(state.hashTable) : undefined,
+    completionSpecs: cloneCompletionSpecs(state.completionSpecs),
+    defaultCompletionSpec: cloneCompletionSpec(state.defaultCompletionSpec),
+    emptyCompletionSpec: cloneCompletionSpec(state.emptyCompletionSpec),
+  };
+}
+
+/**
  * Install an isolated copy of mutable shell namespace state and return an
  * idempotent rollback. Process-wide accounting and PID allocation deliberately
  * remain shared with the parent execution.
@@ -141,70 +210,10 @@ export function beginIsolatedShellState(state: InterpreterState): () => void {
     bashPid: state.bashPid,
     expansionExitCode: state.expansionExitCode,
     expansionStderr: state.expansionStderr,
+    lastBackgroundPid: state.lastBackgroundPid,
   };
 
-  state.env = new Map(state.env);
-  state.arrays = cloneArrays(state.arrays);
-  state.options = { ...state.options };
-  state.shoptOptions = { ...state.shoptOptions };
-  state.fileDescriptors = state.fileDescriptors
-    ? new Map(state.fileDescriptors)
-    : undefined;
-  // Travels with the descriptor table it classifies.
-  state.inputFds = state.inputFds ? new Set(state.inputFds) : undefined;
-  state.fdAliases = cloneFdAliases(state.fdAliases);
-  state.closedStandardFds = state.closedStandardFds
-    ? new Set(state.closedStandardFds)
-    : undefined;
-  state.readonlyVars = new Set(state.readonlyVars);
-  state.associativeArrays = new Set(state.associativeArrays);
-  state.namerefs = new Set(state.namerefs);
-  state.boundNamerefs = new Set(state.boundNamerefs);
-  state.invalidNamerefs = new Set(state.invalidNamerefs);
-  state.integerVars = new Set(state.integerVars);
-  state.lowercaseVars = new Set(state.lowercaseVars);
-  state.uppercaseVars = new Set(state.uppercaseVars);
-  state.exportedVars = new Set(state.exportedVars);
-  state.tempExportedVars = new Set(state.tempExportedVars);
-  state.localExportedVars = state.localExportedVars?.map(
-    (vars) => new Set(vars),
-  );
-  state.declaredVars = new Set(state.declaredVars);
-  state.localScopes = state.localScopes.map((scope) => new Map(scope));
-  state.localArrayScopes = cloneLocalArrayScopes(state.localArrayScopes);
-  state.localVarDepth = state.localVarDepth
-    ? new Map(state.localVarDepth)
-    : undefined;
-  state.localVarStack = cloneLocalVarStack(state.localVarStack);
-  state.fullyUnsetLocals = state.fullyUnsetLocals
-    ? new Map(state.fullyUnsetLocals)
-    : undefined;
-  state.tempEnvBindings = state.tempEnvBindings?.map(
-    (bindings) => new Map(bindings),
-  );
-  state.mutatedTempEnvVars = state.mutatedTempEnvVars
-    ? new Set(state.mutatedTempEnvVars)
-    : undefined;
-  state.accessedTempEnvVars = state.accessedTempEnvVars
-    ? new Set(state.accessedTempEnvVars)
-    : undefined;
-  state.functions = new Map(state.functions);
-  state.callLineStack = state.callLineStack
-    ? [...state.callLineStack]
-    : undefined;
-  state.funcNameStack = state.funcNameStack
-    ? [...state.funcNameStack]
-    : undefined;
-  state.sourceStack = state.sourceStack ? [...state.sourceStack] : undefined;
-  state.directoryStack = state.directoryStack
-    ? [...state.directoryStack]
-    : undefined;
-  state.hashTable = state.hashTable ? new Map(state.hashTable) : undefined;
-  state.completionSpecs = cloneCompletionSpecs(state.completionSpecs);
-  state.defaultCompletionSpec = cloneCompletionSpec(
-    state.defaultCompletionSpec,
-  );
-  state.emptyCompletionSpec = cloneCompletionSpec(state.emptyCompletionSpec);
+  Object.assign(state, cloneIsolatedShellState(state));
 
   let restored = false;
   return () => {

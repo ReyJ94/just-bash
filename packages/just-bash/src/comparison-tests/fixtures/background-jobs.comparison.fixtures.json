@@ -1,0 +1,44 @@
+{
+  "2a29f4f878f92b51": {
+    "command": "wait; echo status=$?",
+    "files": {},
+    "stdout": "status=0\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "6e492252f35a6b5c": {
+    "command": "(sleep 0.03; exit 4) & slow=$!; (sleep 0.001; exit 7) & fast=$!; wait -n $slow $fast; echo first=$?; wait $slow; echo slow=$?",
+    "files": {},
+    "stdout": "first=7\nslow=4\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "72c71f74a5e54603": {
+    "command": "false & pid=$!; wait $pid; echo status=$?",
+    "files": {},
+    "stdout": "status=1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "789cfe90e496b4d0": {
+    "command": "x=parent; { x=child; printf child > job.txt; } & wait; printf '%s|' \"$x\"; cat job.txt",
+    "files": {},
+    "stdout": "parent|child",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "804589616d341a32": {
+    "command": "false & pid=$!; wait -f $pid; echo status=$?",
+    "files": {},
+    "stdout": "status=1\n",
+    "stderr": "",
+    "exitCode": 0
+  },
+  "f0c94ee0e2b55466": {
+    "command": "{ sleep 0.03; echo slow; } & { sleep 0.001; echo fast; } & wait",
+    "files": {},
+    "stdout": "fast\nslow\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

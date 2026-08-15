@@ -57,7 +57,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
   it("should call a tool and print the result", async () => {
     const bash = createBashWithTools();
     const r = await bash.exec(
-      `js-exec -c 'const r = tools.math.add({a:3,b:4}); console.log(r.sum)'`,
+      `js-exec -c '(async () => { const r = await tools.math.add({a:3,b:4}); console.log(r.sum); })()'`,
     );
     expect(r.stdout).toBe("7\n");
     expect(r.exitCode).toBe(0);
@@ -66,7 +66,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
   it("should chain multiple tool calls", async () => {
     const bash = createBashWithTools();
     const r = await bash.exec(
-      `js-exec -c 'const s = tools.math.add({a:10,b:20}); const p = tools.math.multiply({a:s.sum,b:3}); console.log(p.product)'`,
+      `js-exec -c '(async () => { const s = await tools.math.add({a:10,b:20}); const p = await tools.math.multiply({a:s.sum,b:3}); console.log(p.product); })()'`,
     );
     expect(r.stdout).toBe("90\n");
     expect(r.exitCode).toBe(0);
@@ -75,7 +75,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
   it("should return structured JSON from tool", async () => {
     const bash = createBashWithTools();
     const r = await bash.exec(
-      `js-exec -c 'console.log(JSON.stringify(tools.math.add({a:1,b:2})))'`,
+      `js-exec -c '(async () => console.log(JSON.stringify(await tools.math.add({a:1,b:2}))))()'`,
     );
     expect(r.stdout).toBe('{"sum":3}\n');
     expect(r.exitCode).toBe(0);
@@ -84,7 +84,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
   it("should error on unknown tool", async () => {
     const bash = createBashWithTools();
     const r = await bash.exec(
-      `js-exec -c 'try { tools.nope.missing(); } catch(e) { console.error(e.message); }'`,
+      `js-exec -c '(async () => { try { await tools.nope.missing(); } catch(e) { console.error(e.message); } })()'`,
     );
     expect(r.stderr).toContain("Unknown tool: nope.missing");
     expect(r.exitCode).toBe(0);
@@ -99,7 +99,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
       },
     });
     const r = await bash.exec(
-      `js-exec -c 'console.log(JSON.stringify(tools.a.b.c.d()))'`,
+      `js-exec -c '(async () => console.log(JSON.stringify(await tools.a.b.c.d())))()'`,
     );
     expect(r.stdout).toBe('{"deep":true}\n');
     expect(r.exitCode).toBe(0);
@@ -108,7 +108,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
   it("should pass through complex arguments", async () => {
     const bash = createBashWithTools();
     const r = await bash.exec(
-      `js-exec -c 'const r = tools.echo.back({arr:[1,2,3],nested:{x:true}}); console.log(JSON.stringify(r))'`,
+      `js-exec -c '(async () => { const r = await tools.echo.back({arr:[1,2,3],nested:{x:true}}); console.log(JSON.stringify(r)); })()'`,
     );
     expect(r.stdout).toBe('{"arr":[1,2,3],"nested":{"x":true}}\n');
     expect(r.exitCode).toBe(0);
@@ -127,7 +127,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
       },
     });
     const r = await bash.exec(
-      `js-exec -c 'const u = tools.async.fetch({id:42}); console.log(u.name)'`,
+      `js-exec -c '(async () => { const u = await tools.async.fetch({id:42}); console.log(u.name); })()'`,
     );
     expect(r.stdout).toBe("User 42\n");
     expect(r.exitCode).toBe(0);
@@ -166,7 +166,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
       },
     });
     const r = await bash.exec(
-      `js-exec -c 'const r = tools.void.action(); console.log(typeof r)'`,
+      `js-exec -c '(async () => { const r = await tools.void.action(); console.log(typeof r); })()'`,
     );
     expect(r.stdout).toBe("undefined\n");
     expect(r.exitCode).toBe(0);
@@ -185,7 +185,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
       },
     });
     const r = await bash.exec(
-      `js-exec -c 'try { tools.fail.hard(); } catch(e) { console.error(e.message); }'`,
+      `js-exec -c '(async () => { try { await tools.fail.hard(); } catch(e) { console.error(e.message); } })()'`,
     );
     expect(r.stderr).toContain("tool exploded");
     expect(r.exitCode).toBe(0);
@@ -205,7 +205,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
       },
     });
     const r = await bash.exec(
-      `js-exec -c 'const r = tools.time.now(); console.log(r.ts); console.log(r.noArgs)'`,
+      `js-exec -c '(async () => { const r = await tools.time.now(); console.log(r.ts); console.log(r.noArgs); })()'`,
     );
     expect(r.stdout).toBe("1234567890\ntrue\n");
     expect(r.exitCode).toBe(0);
@@ -225,7 +225,7 @@ describe("js-exec tools proxy via JavaScriptConfig.invokeTool", () => {
       },
     });
     const r = await bash.exec(
-      `js-exec -c 'const fs = require("fs"); const content = fs.readFileSync("/data/test.txt", "utf8"); const r = tools.str.upper({s: content}); console.log(r.result)'`,
+      `js-exec -c '(async () => { const fs = require("fs"); const content = fs.readFileSync("/data/test.txt", "utf8"); const r = await tools.str.upper({s: content}); console.log(r.result); })()'`,
     );
     expect(r.stdout).toBe("HELLO FROM FILE\n");
     expect(r.exitCode).toBe(0);

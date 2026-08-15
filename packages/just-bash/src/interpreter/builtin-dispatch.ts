@@ -610,8 +610,7 @@ export async function dispatchBuiltin(
     return { ...result, internalProducerOmitsShellPrefix: true };
   }
   if (commandName === "wait") {
-    // wait - wait for background jobs (stub: no-op in this context)
-    return OK;
+    return ctx.backgroundJobs ? await ctx.backgroundJobs.wait(args) : OK;
   }
   if (commandName === "type") {
     return await handleTypeHelper(

@@ -2,11 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EMPTY_BYTES } from "../../encoding.js";
 import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
 import { resolveLimits } from "../../limits.js";
-import type { RuntimeCommandContext } from "../../types.js";
-import type { JsExecWorkerInput } from "./js-exec-worker.js";
+import type { RuntimeCommandContext, ToolInvoker } from "../../types.js";
+import type {
+  JsExecMainToWorkerMessage,
+  JsExecToolResponse,
+  JsExecWorkerInput,
+} from "./js-exec-worker.js";
 
 type MockWorkerController = {
   inputs: JsExecWorkerInput[];
+  toolResponses: JsExecToolResponse[];
   emit: (event: string, payload?: unknown) => void;
   terminated: boolean;
 };
@@ -35,6 +40,7 @@ vi.mock("node:worker_threads", () => {
       }
       this.controller = {
         inputs: [],
+        toolResponses: [],
         emit: (event, payload) => this.emit(event, payload),
         terminated: false,
       };
@@ -48,12 +54,16 @@ vi.mock("node:worker_threads", () => {
       return this;
     }
 
-    postMessage(input: JsExecWorkerInput): void {
+    postMessage(message: JsExecMainToWorkerMessage): void {
       if (mockState.postMessageThrows > 0) {
         mockState.postMessageThrows--;
         throw new Error("mock worker postMessage failed");
       }
-      this.controller.inputs.push(input);
+      if ("type" in message && message.type === "tool-response") {
+        this.controller.toolResponses.push(message);
+      } else {
+        this.controller.inputs.push(message as JsExecWorkerInput);
+      }
     }
 
     terminate(): Promise<number> {
@@ -100,14 +110,19 @@ vi.mock("../worker-bridge/protocol.js", () => ({
 
 import { _resetJsExecWorkerForTests, jsExecCommand } from "./js-exec.js";
 
-function context(signal?: AbortSignal): RuntimeCommandContext {
+function context(
+  signal?: AbortSignal,
+  invokeTool?: ToolInvoker,
+  maxWorkerMessageBytes?: number,
+): RuntimeCommandContext {
   return {
     fs: new InMemoryFs(),
     cwd: "/home/user",
     env: new Map(),
     stdin: EMPTY_BYTES,
-    limits: resolveLimits({ maxJsTimeoutMs: 1_000 }),
+    limits: resolveLimits({ maxJsTimeoutMs: 1_000, maxWorkerMessageBytes }),
     signal,
+    invokeTool,
   };
 }
 
@@ -255,5 +270,190 @@ describe("js-exec initialization failure", () => {
     expect(next.exitCode).toBe(1);
     expect(mockState.workers).toHaveLength(1);
     expect(mockState.workers[0].inputs).toHaveLength(0);
+  });
+
+  it("rejects tool requests with the wrong execution token", async () => {
+    const invokeTool = vi.fn(async () => "{}");
+    const execution = jsExecCommand.execute(
+      ["-c", "1"],
+      context(undefined, invokeTool),
+    );
+    const worker = mockState.workers[0];
+    const token = worker.inputs[0].protocolToken;
+
+    worker.emit("message", {
+      protocolToken: "wrong-token",
+      type: "tool-request",
+      requestId: 1,
+      path: "tool.run",
+      argsJson: "{}",
+    });
+
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(1));
+    expect(worker.toolResponses[0]).toMatchObject({
+      protocolToken: token,
+      requestId: 1,
+      success: false,
+      error: "invalid tool request protocol token",
+    });
+    expect(invokeTool).not.toHaveBeenCalled();
+
+    worker.emit("message", { protocolToken: token, success: true });
+    expect((await execution).exitCode).toBe(0);
+  });
+
+  it("rejects a request ID after its first use, including after settlement", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const invokeTool = vi.fn(async () => {
+      await gate;
+      return "{}";
+    });
+    const execution = jsExecCommand.execute(
+      ["-c", "1"],
+      context(undefined, invokeTool),
+    );
+    const worker = mockState.workers[0];
+    const token = worker.inputs[0].protocolToken;
+    const request = {
+      protocolToken: token,
+      type: "tool-request",
+      requestId: 7,
+      path: "tool.run",
+      argsJson: "{}",
+    } as const;
+
+    worker.emit("message", request);
+    await vi.waitFor(() => expect(invokeTool).toHaveBeenCalledTimes(1));
+    worker.emit("message", request);
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(1));
+    expect(worker.toolResponses[0]).toMatchObject({
+      requestId: 7,
+      success: false,
+      error: "duplicate tool request ID",
+    });
+
+    release();
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(2));
+    expect(worker.toolResponses[1]).toMatchObject({
+      requestId: 7,
+      success: true,
+    });
+    worker.emit("message", request);
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(3));
+    expect(worker.toolResponses[2]).toMatchObject({
+      requestId: 7,
+      success: false,
+      error: "duplicate tool request ID",
+    });
+    expect(invokeTool).toHaveBeenCalledTimes(1);
+
+    worker.emit("message", { protocolToken: token, success: true });
+    expect((await execution).exitCode).toBe(0);
+  });
+
+  it("does not allow a concurrency-rejected request ID to be replayed", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const invokeTool = vi.fn(async () => {
+      await gate;
+      return "{}";
+    });
+    const ctx = context(undefined, invokeTool);
+    ctx.limits = resolveLimits({
+      maxJsTimeoutMs: 1_000,
+      maxConcurrentJobs: 1,
+    });
+    const execution = jsExecCommand.execute(["-c", "1"], ctx);
+    const worker = mockState.workers[0];
+    const token = worker.inputs[0].protocolToken;
+    const request = (requestId: number) => ({
+      protocolToken: token,
+      type: "tool-request" as const,
+      requestId,
+      path: "tool.run",
+      argsJson: "{}",
+    });
+
+    worker.emit("message", request(1));
+    await vi.waitFor(() => expect(invokeTool).toHaveBeenCalledTimes(1));
+    worker.emit("message", request(2));
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(1));
+    expect(worker.toolResponses[0]).toMatchObject({
+      requestId: 2,
+      success: false,
+      error: "maximum concurrent tool calls exceeded (1)",
+    });
+
+    release();
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(2));
+    worker.emit("message", request(2));
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(3));
+    expect(worker.toolResponses[2]).toMatchObject({
+      requestId: 2,
+      success: false,
+      error: "duplicate tool request ID",
+    });
+    expect(invokeTool).toHaveBeenCalledTimes(1);
+
+    worker.emit("message", { protocolToken: token, success: true });
+    expect((await execution).exitCode).toBe(0);
+  });
+
+  it("terminates the owned worker on an oversized tool request", async () => {
+    const invokeTool = vi.fn(async () => "{}");
+    const execution = jsExecCommand.execute(
+      ["-c", "1"],
+      context(undefined, invokeTool, 1_024),
+    );
+    const worker = mockState.workers[0];
+    const token = worker.inputs[0].protocolToken;
+
+    worker.emit("message", {
+      protocolToken: token,
+      type: "tool-request",
+      requestId: 1,
+      path: "tool.run",
+      argsJson: "x".repeat(2_000),
+    });
+
+    const result = await execution;
+    expect(result.stderr).toContain("worker request exceeds 1024 byte limit");
+    expect(result.exitCode).toBe(1);
+    expect(worker.terminated).toBe(true);
+    expect(invokeTool).not.toHaveBeenCalled();
+  });
+
+  it("turns an oversized host result into a bounded tool rejection", async () => {
+    const invokeTool = vi.fn(async () => "x".repeat(2_000));
+    const execution = jsExecCommand.execute(
+      ["-c", "1"],
+      context(undefined, invokeTool, 1_024),
+    );
+    const worker = mockState.workers[0];
+    const token = worker.inputs[0].protocolToken;
+
+    worker.emit("message", {
+      protocolToken: token,
+      type: "tool-request",
+      requestId: 1,
+      path: "tool.run",
+      argsJson: "{}",
+    });
+
+    await vi.waitFor(() => expect(worker.toolResponses).toHaveLength(1));
+    expect(worker.toolResponses[0]).toMatchObject({
+      requestId: 1,
+      success: false,
+      error: "js-exec: worker response exceeds 1024 byte limit",
+    });
+    expect(worker.toolResponses[0].resultJson).toBeUndefined();
+
+    worker.emit("message", { protocolToken: token, success: true });
+    expect((await execution).exitCode).toBe(0);
   });
 });

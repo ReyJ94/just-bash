@@ -10,6 +10,7 @@ import { Parser } from "../../parser/parser.js";
 import { ExecutionLimitError, ExitError } from "../errors.js";
 import { cloneArrays } from "../helpers/array.js";
 import type { InterpreterContext } from "../types.js";
+import { allocateVirtualPid } from "../virtual-process.js";
 import { escapeGlobChars } from "./glob-escape.js";
 
 /**
@@ -117,7 +118,7 @@ async function executeCommandSubstitutionFromString(
 
   // Execute in subshell-like context
   const savedBashPid = ctx.state.bashPid;
-  ctx.state.bashPid = ctx.state.nextVirtualPid++;
+  ctx.state.bashPid = allocateVirtualPid(ctx.state);
   const savedEnv = new Map(ctx.state.env);
   const savedArrays = cloneArrays(ctx.state.arrays);
   const savedCwd = ctx.state.cwd;

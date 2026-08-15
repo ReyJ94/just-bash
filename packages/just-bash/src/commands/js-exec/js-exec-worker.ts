@@ -15,6 +15,7 @@ import { parentPort } from "node:worker_threads";
 import {
   getQuickJS,
   type QuickJSContext,
+  type QuickJSDeferredPromise,
   type QuickJSHandle,
   type QuickJSRuntime,
   type QuickJSWASMModule,
@@ -55,6 +56,23 @@ export interface JsExecWorkerInput {
   hasInvokeTool?: boolean;
 }
 
+export interface JsExecToolResponse {
+  protocolToken: string;
+  type: "tool-response";
+  requestId: number;
+  success: boolean;
+  resultJson?: string;
+  error?: string;
+}
+
+export interface JsExecToolRequest {
+  protocolToken: string;
+  type: "tool-request";
+  requestId: number;
+  path: string;
+  argsJson: string;
+}
+
 export interface JsExecWorkerOutput {
   protocolToken?: string;
   type?: "initialization-failure";
@@ -62,6 +80,9 @@ export interface JsExecWorkerOutput {
   error?: string;
   defenseStats?: WorkerDefenseStats;
 }
+
+export type JsExecMainToWorkerMessage = JsExecWorkerInput | JsExecToolResponse;
+export type JsExecWorkerMessage = JsExecWorkerOutput | JsExecToolRequest;
 
 let quickjsModule: QuickJSWASMModule | null = null;
 let quickjsLoading: Promise<QuickJSWASMModule> | null = null;
@@ -85,6 +106,172 @@ const MEMORY_LIMIT = 64 * 1024 * 1024;
 const INTERRUPT_CYCLES = 100000;
 
 const PROCESS_EXIT_MARKER = "__just_bash_process_exit_marker__";
+
+interface PendingToolCall {
+  readonly deferred: QuickJSDeferredPromise;
+}
+
+class AsyncToolBridge {
+  private readonly pending = new Map<number, PendingToolCall>();
+  private readonly idleWaiters = new Set<() => void>();
+  private nextRequestId = 1;
+  private disposed = false;
+
+  constructor(
+    private readonly context: QuickJSContext,
+    private readonly runtime: QuickJSRuntime,
+    private readonly protocolToken: string,
+  ) {}
+
+  invoke(path: string, argsJson: string): QuickJSHandle {
+    if (this.disposed) return contextError(this.context, "tool bridge closed");
+    const requestId = this.nextRequestId++;
+    const deferred = this.context.newPromise();
+    this.pending.set(requestId, { deferred });
+    const request: JsExecToolRequest = {
+      protocolToken: this.protocolToken,
+      type: "tool-request",
+      requestId,
+      path,
+      argsJson,
+    };
+    parentPort?.postMessage(request);
+    return deferred.handle;
+  }
+
+  handleResponse(message: JsExecToolResponse): void {
+    if (this.disposed || message.protocolToken !== this.protocolToken) return;
+    const call = this.pending.get(message.requestId);
+    if (!call) return;
+    this.pending.delete(message.requestId);
+    if (message.success) {
+      const value = this.context.newString(message.resultJson ?? "");
+      call.deferred.resolve(value);
+      value.dispose();
+    } else {
+      const error = this.context.newError(
+        message.error || "tool invocation failed",
+      );
+      call.deferred.reject(error);
+      error.dispose();
+    }
+    this.pumpPendingJobs();
+    call.deferred.dispose();
+    this.resolveIdleIfNeeded();
+  }
+
+  waitForIdle(): Promise<void> {
+    if (this.pending.size === 0) return Promise.resolve();
+    return new Promise((resolve) => this.idleWaiters.add(resolve));
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const { deferred } of this.pending.values()) deferred.dispose();
+    this.pending.clear();
+    this.resolveIdleIfNeeded();
+  }
+
+  pumpPendingJobs(): void {
+    const pendingResult = this.runtime.executePendingJobs();
+    if ("error" in pendingResult && pendingResult.error) {
+      const errorValue = this.context.dump(pendingResult.error);
+      pendingResult.error.dispose();
+      throw new Error(formatError(errorValue));
+    }
+  }
+
+  private resolveIdleIfNeeded(): void {
+    if (this.pending.size > 0) return;
+    for (const resolve of this.idleWaiters) resolve();
+    this.idleWaiters.clear();
+  }
+}
+
+function contextError(context: QuickJSContext, message: string): QuickJSHandle {
+  const deferred = context.newPromise();
+  const error = context.newError(message);
+  deferred.reject(error);
+  error.dispose();
+  return deferred.handle;
+}
+
+let activeToolBridge: AsyncToolBridge | undefined;
+
+function isToolResponse(
+  message: JsExecMainToWorkerMessage,
+): message is JsExecToolResponse {
+  return (message as { type?: unknown }).type === "tool-response";
+}
+
+type EvaluationOutcome =
+  | { readonly type: "fulfilled" }
+  | { readonly type: "rejected"; readonly error: string }
+  | { readonly type: "process-exit" };
+
+interface EvaluationObservation {
+  readonly completion: Promise<EvaluationOutcome>;
+  dispose(): void;
+}
+
+function observeEvaluation(
+  context: QuickJSContext,
+  value: QuickJSHandle,
+  processExitMarker: QuickJSHandle,
+): EvaluationObservation {
+  const then = context.getProp(value, "then");
+  if (context.typeof(then) !== "function") {
+    then.dispose();
+    return {
+      completion: Promise.resolve({ type: "fulfilled" }),
+      dispose: () => {},
+    };
+  }
+
+  let settle!: (outcome: EvaluationOutcome) => void;
+  const completion = new Promise<EvaluationOutcome>((resolve) => {
+    settle = resolve;
+  });
+  let settled = false;
+  const finish = (outcome: EvaluationOutcome) => {
+    if (settled) return;
+    settled = true;
+    settle(outcome);
+  };
+  const fulfilled = context.newFunction("evaluationFulfilled", () => {
+    finish({ type: "fulfilled" });
+    return context.undefined;
+  });
+  const rejected = context.newFunction(
+    "evaluationRejected",
+    (error: QuickJSHandle) => {
+      finish(
+        isProcessExit(context, error, processExitMarker)
+          ? { type: "process-exit" }
+          : { type: "rejected", error: formatError(context.dump(error)) },
+      );
+      return context.undefined;
+    },
+  );
+  const attached = context.callFunction(then, value, fulfilled, rejected);
+  then.dispose();
+  if (attached.error) {
+    const error = formatError(context.dump(attached.error));
+    attached.error.dispose();
+    finish({ type: "rejected", error });
+  } else {
+    attached.value.dispose();
+  }
+
+  return {
+    completion,
+    dispose: () => {
+      fulfilled.dispose();
+      rejected.dispose();
+    },
+  };
+}
 
 /**
  * Format a dumped QuickJS error value into a readable error string
@@ -394,6 +581,7 @@ function setupContext(
   backend: SyncBackend,
   input: JsExecWorkerInput,
   processExitMarker: QuickJSHandle,
+  toolBridge: AsyncToolBridge | undefined,
 ): void {
   // --- console ---
   const consoleObj = context.newObject();
@@ -796,15 +984,8 @@ function setupContext(
       (pathHandle: QuickJSHandle, argsHandle: QuickJSHandle) => {
         const path = context.getString(pathHandle);
         const argsJson = context.getString(argsHandle);
-        try {
-          const resultJson = backend.invokeTool(path, argsJson);
-          return context.newString(resultJson);
-        } catch (e) {
-          return throwError(
-            context,
-            (e as Error).message || "tool invocation failed",
-          );
-        }
+        if (!toolBridge) return throwError(context, "tool bridge unavailable");
+        return toolBridge.invoke(path, argsJson);
       },
     );
     context.setProp(context.global, "__invokeTool", invokeToolFn);
@@ -1110,7 +1291,7 @@ async function initializeWithDefense(): Promise<void> {
 /**
  * JavaScript source that installs the `tools` proxy in the QuickJS guest.
  * The proxy builds a dot-separated path from property access and calls the
- * host's `__invokeTool` host function (which bridges via SAB to invokeTool).
+ * host's Promise-returning `__invokeTool` function.
  * Console output is unaffected; it still flows to stdout/stderr normally.
  */
 const TOOLS_PROXY_SETUP_SOURCE = `(function() {
@@ -1125,8 +1306,9 @@ const TOOLS_PROXY_SETUP_SOURCE = `(function() {
         if (!toolPath) throw new Error('Tool path missing in invocation');
         var argsJson = args.length > 0 ? JSON.stringify(args[0]) : '';
         if (argsJson === undefined) argsJson = '';
-        var resultJson = globalThis.__invokeTool(toolPath, argsJson);
-        return resultJson !== undefined && resultJson !== '' ? JSON.parse(resultJson) : undefined;
+        return globalThis.__invokeTool(toolPath, argsJson).then(function(resultJson) {
+          return resultJson !== undefined && resultJson !== '' ? JSON.parse(resultJson) : undefined;
+        });
       }
     });
   })([]);
@@ -1141,6 +1323,7 @@ async function executeCode(
   let runtime: QuickJSRuntime | undefined;
   let context: QuickJSContext | undefined;
   let processExitMarker: QuickJSHandle | undefined;
+  let toolBridge: AsyncToolBridge | undefined;
   try {
     runtime = qjs.newRuntime();
     runtime.setMemoryLimit(MEMORY_LIMIT);
@@ -1157,7 +1340,11 @@ async function executeCode(
 
     context = runtime.newContext();
     processExitMarker = context.newObject();
-    setupContext(context, backend, input, processExitMarker);
+    toolBridge = input.hasInvokeTool
+      ? new AsyncToolBridge(context, runtime, input.protocolToken)
+      : undefined;
+    activeToolBridge = toolBridge;
+    setupContext(context, backend, input, processExitMarker, toolBridge);
 
     // Defense-in-depth: remove eval(), neuter Function constructors,
     // and freeze all intrinsic prototypes to prevent prototype pollution.
@@ -1393,9 +1580,23 @@ async function executeCode(
     if (input.stripTypes) {
       jsCode = stripTypeScriptTypes(jsCode);
     }
-    const result = input.isModule
+    let result = input.isModule
       ? context.evalCode(jsCode, filename, { type: "module" })
       : context.evalCode(jsCode, filename);
+
+    // QuickJS parses ordinary async functions correctly in script mode, while
+    // top-level await requires module mode. Only retry after a syntax failure:
+    // the first evaluation cannot have produced effects, and QuickJS remains
+    // the syntax authority instead of a host regex trying to model JS scopes.
+    if (!input.isModule && result.error && /\bawait\s+[\w([`]/.test(jsCode)) {
+      const name = context.getProp(result.error, "name");
+      const isSyntaxError = context.getString(name) === "SyntaxError";
+      name.dispose();
+      if (isSyntaxError) {
+        result.error.dispose();
+        result = context.evalCode(jsCode, filename, { type: "module" });
+      }
+    }
 
     if (result.error) {
       if (isProcessExit(context, result.error, processExitMarker)) {
@@ -1416,13 +1617,15 @@ async function executeCode(
       return { success: true };
     }
 
-    // Execute pending jobs (promise callbacks, module bodies).
-    // Must always run so .then() chains work in both script and module mode.
-    // Must happen before exit so bridge is still alive. Modules use the native
-    // promise bridge to wait for top-level await without polling the VM state.
-    const moduleCompletion = input.isModule
-      ? context.resolvePromise(result.value)
-      : undefined;
+    // Observe the returned guest Promise directly. QuickJS's host-side
+    // resolvePromise helper is not a reliable completion owner for promises
+    // resumed by later worker messages, while attaching guest callbacks keeps
+    // the execution tied to the same QuickJS job queue as tool responses.
+    const evaluation = observeEvaluation(
+      context,
+      result.value,
+      processExitMarker,
+    );
     const pendingResult = runtime.executePendingJobs();
     if ("error" in pendingResult && pendingResult.error) {
       if (isProcessExit(context, pendingResult.error, processExitMarker)) {
@@ -1440,32 +1643,33 @@ async function executeCode(
         // Output limit exceeded — ignore writeStderr failure
       }
       backend.exit(1);
+      evaluation.dispose();
       return { success: true };
     }
 
-    if (moduleCompletion) {
-      const moduleResult = await moduleCompletion;
-      if (moduleResult.error) {
-        if (isProcessExit(context, moduleResult.error, processExitMarker)) {
-          moduleResult.error.dispose();
-          result.value.dispose();
-          // Exit was already signaled via backend.exit().
-          return { success: true };
-        }
-        const errorVal = context.dump(moduleResult.error);
-        moduleResult.error.dispose();
-        result.value.dispose();
-        const errorMsg = formatError(errorVal);
-        try {
-          backend.writeStderr(`${errorMsg}\n`);
-        } catch {
-          // Output limit exceeded — ignore writeStderr failure
-        }
-        backend.exit(1);
-        return { success: true };
-      }
-      moduleResult.value.dispose();
+    const evaluationOutcome = await evaluation.completion;
+    evaluation.dispose();
+    if (evaluationOutcome.type === "process-exit") {
+      result.value.dispose();
+      // Exit was already signaled via backend.exit().
+      return { success: true };
     }
+    if (evaluationOutcome.type === "rejected") {
+      result.value.dispose();
+      try {
+        backend.writeStderr(`${evaluationOutcome.error}\n`);
+      } catch {
+        // Output limit exceeded — ignore writeStderr failure
+      }
+      backend.exit(1);
+      return { success: true };
+    }
+
+    // Successful unawaited calls still belong to this execution. A response
+    // may schedule another guest promise callback (and another tool request),
+    // so the bridge resolves idle only after pumping that callback queue.
+    await toolBridge?.waitForIdle();
+    toolBridge?.pumpPendingJobs();
 
     result.value.dispose();
 
@@ -1492,6 +1696,8 @@ async function executeCode(
     }
     return { success: true };
   } finally {
+    if (activeToolBridge === toolBridge) activeToolBridge = undefined;
+    toolBridge?.dispose();
     processExitMarker?.dispose();
     context?.dispose();
     runtime?.dispose();
@@ -1506,8 +1712,13 @@ void initPromise.catch((error) => {
   initializationFailure = error;
 });
 
-// Handle messages from main thread
-parentPort?.on("message", async (input: JsExecWorkerInput) => {
+// Handle execution requests and asynchronous tool responses from main thread.
+parentPort?.on("message", async (message: JsExecMainToWorkerMessage) => {
+  if (isToolResponse(message)) {
+    activeToolBridge?.handleResponse(message);
+    return;
+  }
+  const input = message;
   let initialized = false;
   try {
     if (initializationFailure !== undefined) throw initializationFailure;

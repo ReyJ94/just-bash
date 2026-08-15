@@ -119,6 +119,7 @@ All commands support `--help` for usage information.
 - **Pipes**: `cmd1 | cmd2`
 - **Redirections**: `>`, `>>`, `2>`, `2>&1`, `<`
 - **Command chaining**: `&&`, `||`, `;`
+- **Bounded background jobs**: `command &`, `$!`, `wait`, `wait PID`, `wait -n`
 - **Variables**: `$VAR`, `${VAR}`, `${VAR:-default}`
 - **Positional parameters**: `$1`, `$2`, `$@`, `$#`
 - **Glob patterns**: `*`, `?`, `[...]`
@@ -474,6 +475,10 @@ const bash = new Bash({
 await bash.exec(`js-exec -c 'console.log((await tools.math.add({a:3,b:4})).sum)'`);
 ```
 
+Every `tools.*` call returns a Promise. Calls started before awaiting can run
+concurrently, and `Promise.all` retains JavaScript input order. The optional
+third `invokeTool` argument contains the owning execution's abort signal.
+
 The hook is generic — wire any tool framework through it (raw maps, MCP,
 Anthropic tool-use, etc.). For full GraphQL / OpenAPI / MCP discovery via
 `@executor-js/sdk`, plus auto-generated bash namespace commands, use the
@@ -656,6 +661,7 @@ const env = new Bash({
   executionLimits: {
     maxCallDepth: 100, // Max function recursion depth
     maxCommandCount: 20000, // Shared across nested execution
+    maxConcurrentJobs: 16, // Active Bash jobs and js-exec host tools
     maxSourceBytes: 8 * 1024 * 1024, // Shell source before parsing
     maxFileSystemBytes: 256 * 1024 * 1024, // Retained default-FS data
     maxOutputSize: 32 * 1024 * 1024, // Aggregate stdout + stderr bytes

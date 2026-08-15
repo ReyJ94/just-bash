@@ -41,6 +41,7 @@ import type { ExecResult } from "../types.js";
 import { ExecutionLimitError, ExitError } from "./errors.js";
 import { cloneArrays } from "./helpers/array.js";
 import type { InterpreterContext } from "./types.js";
+import { allocateVirtualPid } from "./virtual-process.js";
 
 /**
  * Directory holding the synthetic descriptor files. Matches the Linux path
@@ -276,7 +277,7 @@ async function runBody(
   const savedExitCodeVar = ctx.state.env.get("?");
 
   ctx.substitutionDepth = currentDepth + 1;
-  ctx.state.bashPid = ctx.state.nextVirtualPid++;
+  ctx.state.bashPid = allocateVirtualPid(ctx.state);
   ctx.state.suppressVerbose = true;
   if (stdin !== undefined) ctx.state.groupStdin = stdin;
 

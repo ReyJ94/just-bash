@@ -38,6 +38,7 @@ import {
 } from "./redirections.js";
 import { beginIsolatedShellState } from "./state-transaction.js";
 import type { InterpreterContext } from "./types.js";
+import { allocateVirtualPid } from "./virtual-process.js";
 
 /**
  * Type for executeStatement callback
@@ -65,7 +66,7 @@ export async function executeSubshell(
   const restoreState = beginIsolatedShellState(ctx.state);
   ctx.state.parentHasLoopContext = parentLoopDepth > 0;
   ctx.state.loopDepth = 0;
-  ctx.state.bashPid = ctx.state.nextVirtualPid++;
+  ctx.state.bashPid = allocateVirtualPid(ctx.state);
   try {
     return await withPreparedRedirections(
       ctx,
@@ -355,7 +356,7 @@ export async function executeUserScript(
   // Set up subshell-like environment
   ctx.state.parentHasLoopContext = parentLoopDepth > 0;
   ctx.state.loopDepth = 0;
-  ctx.state.bashPid = ctx.state.nextVirtualPid++;
+  ctx.state.bashPid = allocateVirtualPid(ctx.state);
   if (stdin) {
     ctx.state.groupStdin = stdin;
   }

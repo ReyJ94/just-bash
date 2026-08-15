@@ -22,6 +22,9 @@ export interface ExecutionLimits {
   /** Maximum number of commands to execute (normal default: 100000) */
   maxCommandCount?: number;
 
+  /** Maximum concurrently active virtual background jobs (normal default: 64) */
+  maxConcurrentJobs?: number;
+
   /** Maximum loop iterations for bash while/for/until loops (normal default: 100000) */
   maxLoopIterations?: number;
 
@@ -162,6 +165,7 @@ const DEFAULT_LIMITS: Required<ExecutionLimits> = {
   maxExecDepth: 64,
   maxCallDepth: 100,
   maxCommandCount: 100000,
+  maxConcurrentJobs: 64,
   maxLoopIterations: 100000,
   maxAwkIterations: 100000,
   maxSedIterations: 100000,
@@ -215,6 +219,7 @@ const HARDENED_LIMITS: Required<ExecutionLimits> = {
   ...DEFAULT_LIMITS,
   maxSourceBytes: 8 * 1024 * 1024,
   maxCommandCount: 10_000,
+  maxConcurrentJobs: 16,
   maxLoopIterations: 10_000,
   maxAwkIterations: 10_000,
   maxSedIterations: 10_000,
@@ -276,6 +281,8 @@ export function resolveLimits(
     maxExecDepth: userLimits.maxExecDepth ?? defaults.maxExecDepth,
     maxCallDepth: userLimits.maxCallDepth ?? defaults.maxCallDepth,
     maxCommandCount: userLimits.maxCommandCount ?? defaults.maxCommandCount,
+    maxConcurrentJobs:
+      userLimits.maxConcurrentJobs ?? defaults.maxConcurrentJobs,
     maxLoopIterations:
       userLimits.maxLoopIterations ?? defaults.maxLoopIterations,
     maxAwkIterations: userLimits.maxAwkIterations ?? defaults.maxAwkIterations,

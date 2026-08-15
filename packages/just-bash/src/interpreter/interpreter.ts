@@ -41,6 +41,7 @@ import type {
   CommandRegistry,
   ExecResult,
   FeatureCoverageWriter,
+  ToolInvoker,
   TraceCallback,
 } from "../types.js";
 import { expandAlias as expandAliasHelper } from "./alias-expansion.js";
@@ -49,6 +50,7 @@ import {
   expandLocalArrayAssignment as expandLocalArrayAssignmentHelper,
   expandScalarAssignmentArg as expandScalarAssignmentArgHelper,
 } from "./assignment-expansion.js";
+import { BackgroundJobController } from "./background-jobs.js";
 import {
   type BuiltinDispatchContext,
   dispatchBuiltin,
@@ -70,6 +72,7 @@ import {
   BraceExpansionError,
   BreakError,
   ContinueError,
+  ControlFlowError,
   ErrexitError,
   ExecutionAbortedError,
   ExecutionLimitError,
@@ -102,6 +105,7 @@ import {
   withPreparedRedirections,
 } from "./redirections.js";
 import { processAssignments } from "./simple-command-assignments.js";
+import { cloneIsolatedShellState } from "./state-transaction.js";
 import {
   executeGroup as executeGroupHelper,
   executeSubshell as executeSubshellHelper,
@@ -112,9 +116,19 @@ import type {
   InterpreterExecOptions,
   InterpreterState,
 } from "./types.js";
+import { allocateVirtualPid } from "./virtual-process.js";
 
 function unsupportedCommandNode(node: never): never {
   throw new TypeError(`Unsupported command node: ${JSON.stringify(node)}`);
+}
+
+function backgroundJobsOrThrow(
+  ctx: InterpreterContext,
+): BackgroundJobController {
+  if (!ctx.backgroundJobs) {
+    throw new Error("interpreter background-job controller is unavailable");
+  }
+  return ctx.backgroundJobs;
 }
 
 export type { InterpreterContext, InterpreterState } from "./types.js";
@@ -144,19 +158,26 @@ export interface InterpreterOptions {
   /** Bootstrap JavaScript code for js-exec */
   jsBootstrapCode?: string;
   /** Tool invoker hook for js-exec's `tools` proxy */
-  invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  invokeTool?: ToolInvoker;
 }
 
 export class Interpreter {
   private ctx: InterpreterContext;
+  private scriptDepth = 0;
 
   constructor(options: InterpreterOptions, state: InterpreterState) {
+    const backgroundJobs = new BackgroundJobController(
+      options.executionScope,
+      options.limits.maxConcurrentJobs,
+      () => allocateVirtualPid(state),
+    );
     this.ctx = {
       state,
       fs: options.fs,
       commands: options.commands,
       limits: options.limits,
       executionScope: options.executionScope,
+      backgroundJobs,
       execFn: options.exec,
       executeScript: this.executeScript.bind(this),
       executeStatement: this.executeStatement.bind(this),
@@ -230,6 +251,42 @@ export class Interpreter {
   }
 
   async executeScript(node: ScriptNode): Promise<ExecResult> {
+    const outermost = this.scriptDepth === 0;
+    this.scriptDepth++;
+    let foreground: ExecResult | undefined;
+    try {
+      foreground = await this.executeScriptBody(node);
+      if (!outermost) return foreground;
+      const background = await backgroundJobsOrThrow(this.ctx).drainAll();
+      const output = new ExecutionOutputAccumulator(
+        this.ctx.executionScope,
+        "script with background jobs",
+      );
+      output.appendResult(foreground, decodedTextFromResult(foreground));
+      output.appendResult(background, decodedTextFromResult(background));
+      return output.build(foreground.exitCode, { env: foreground.env });
+    } catch (caught) {
+      let error: unknown = caught;
+      if (outermost) {
+        try {
+          const background = await backgroundJobsOrThrow(this.ctx).drainAll();
+          if (error instanceof ControlFlowError) {
+            error.prependOutput(background.stdout, background.stderr);
+          }
+        } catch (backgroundError) {
+          error = backgroundError;
+        }
+        if (foreground && error instanceof ControlFlowError) {
+          error.prependOutput(foreground.stdout, foreground.stderr);
+        }
+      }
+      throw error;
+    } finally {
+      this.scriptDepth--;
+    }
+  }
+
+  private async executeScriptBody(node: ScriptNode): Promise<ExecResult> {
     this.assertDefenseContext("execution");
 
     let exitCode = 0;
@@ -240,7 +297,16 @@ export class Interpreter {
 
     for (const statement of node.statements) {
       try {
-        const result = await this.executeStatement(statement);
+        const result = statement.background
+          ? this.launchBackgroundStatement(statement)
+          : await this.executeStatement(statement);
+        const completedBackground = backgroundJobsOrThrow(
+          this.ctx,
+        ).takeCompletedOutput();
+        output.appendResult(
+          completedBackground,
+          decodedTextFromResult(completedBackground),
+        );
         // Decode each statement's stdout to text via its explicit `stdoutKind`
         // before concatenating. A script can interleave text-shaped statements
         // (sed, awk — ö as U+00F6) with byte-shaped ones (grep | head — ö as
@@ -408,6 +474,52 @@ export class Interpreter {
       ...output.build(exitCode),
       env: mapToRecord(this.ctx.state.env),
     };
+  }
+
+  private launchBackgroundStatement(node: StatementNode): ExecResult {
+    const childState = cloneIsolatedShellState(this.ctx.state);
+    const pid = backgroundJobsOrThrow(this.ctx).launch(async (jobPid) => {
+      childState.bashPid = jobPid;
+      childState.lastBackgroundPid = 0;
+      const child = new Interpreter(
+        {
+          fs: this.ctx.fs,
+          commands: this.ctx.commands,
+          limits: this.ctx.limits,
+          executionScope: this.ctx.executionScope,
+          exec: this.ctx.execFn,
+          fetch: this.ctx.fetch,
+          sleep: this.ctx.sleep,
+          trace: this.ctx.trace,
+          coverage: this.ctx.coverage,
+          requireDefenseContext: this.ctx.requireDefenseContext,
+          jsBootstrapCode: this.ctx.jsBootstrapCode,
+          invokeTool: this.ctx.invokeTool,
+        },
+        childState,
+      );
+      try {
+        return await child.executeScript({
+          type: "Script",
+          statements: [{ ...node, background: false }],
+        });
+      } catch (error) {
+        if (error instanceof ExitError) {
+          return {
+            stdout: error.stdout,
+            stderr: error.stderr,
+            exitCode: error.exitCode,
+            internalOutputAccounting: error.internalOutputAccounting,
+            env: mapToRecord(childState.env),
+          };
+        }
+        throw error;
+      }
+    });
+    this.ctx.state.lastBackgroundPid = pid;
+    this.ctx.state.lastExitCode = 0;
+    this.ctx.state.env.set("?", "0");
+    return OK;
   }
 
   /**

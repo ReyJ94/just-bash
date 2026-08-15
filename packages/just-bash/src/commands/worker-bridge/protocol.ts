@@ -45,8 +45,6 @@ export const OpCode = {
   HTTP_REQUEST: 200,
   // Sub-shell execution
   EXEC_COMMAND: 300,
-  // Tool invocation (executor mode)
-  INVOKE_TOOL: 400,
 } as const;
 
 export type OpCodeType = (typeof OpCode)[keyof typeof OpCode];

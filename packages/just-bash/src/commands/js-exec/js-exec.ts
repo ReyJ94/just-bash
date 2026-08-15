@@ -24,13 +24,17 @@ import type {
   ExecResult,
   RuntimeCommand,
   RuntimeCommandContext,
+  ToolInvoker,
 } from "../../types.js";
 import { hasHelpFlag } from "../help.js";
 import { BridgeHandler } from "../worker-bridge/bridge-handler.js";
 import { createSharedBuffer } from "../worker-bridge/protocol.js";
 import { WorkerRequestController } from "../worker-request-controller.js";
 import type {
+  JsExecToolRequest,
+  JsExecToolResponse,
   JsExecWorkerInput,
+  JsExecWorkerMessage,
   JsExecWorkerOutput,
 } from "./js-exec-worker.js";
 
@@ -68,7 +72,8 @@ File Extension Auto-Detection:
 Node.js Compatibility:
   Code written for Node.js largely works here. Both require and import
   are supported, the node: prefix works, and standard globals like process,
-  console, and fetch are available. All I/O is synchronous.
+  console, and fetch are available. Filesystem and child-process compatibility
+  APIs are synchronous; host tools return Promises.
 
   Available modules:
     fs, path, child_process, process, console,
@@ -216,11 +221,147 @@ let sharedWorker: Worker | null = null;
 let workerIdleTimeout: ReturnType<typeof setTimeout> | null = null;
 
 // Queue for serializing JS executions (QuickJS is single-threaded)
+class ToolRequestOwner {
+  private readonly activeRequestIds = new Set<number>();
+  private readonly seenRequestIds = new Set<number>();
+  private readonly abortController = new AbortController();
+  private closed = false;
+
+  constructor(
+    private readonly protocolToken: string,
+    private readonly invokeTool: ToolInvoker | undefined,
+    private readonly controller: WorkerRequestController,
+    private readonly maxConcurrentCalls: number,
+  ) {}
+
+  get hasActiveRequests(): boolean {
+    return this.activeRequestIds.size > 0;
+  }
+
+  handle(request: JsExecToolRequest, worker: Worker): void {
+    if (!Number.isSafeInteger(request.requestId) || request.requestId <= 0) {
+      throw new Error("invalid tool request ID");
+    }
+    const validationError = this.validate(request);
+    if (validationError) {
+      this.respond(
+        worker,
+        request.requestId,
+        false,
+        undefined,
+        validationError,
+      );
+      return;
+    }
+    // A request ID is single-use even when policy rejects the request. This
+    // prevents a capped or unavailable call from being replayed later.
+    this.seenRequestIds.add(request.requestId);
+    const invokeTool = this.invokeTool;
+    if (!invokeTool) {
+      this.respond(
+        worker,
+        request.requestId,
+        false,
+        undefined,
+        "tool invocation is not configured",
+      );
+      return;
+    }
+    if (this.activeRequestIds.size >= this.maxConcurrentCalls) {
+      this.respond(
+        worker,
+        request.requestId,
+        false,
+        undefined,
+        `maximum concurrent tool calls exceeded (${this.maxConcurrentCalls})`,
+      );
+      return;
+    }
+
+    this.activeRequestIds.add(request.requestId);
+    void DefenseInDepthBox.runTrustedAsync(() =>
+      invokeTool(request.path, request.argsJson, {
+        signal: this.abortController.signal,
+      }),
+    ).then(
+      (resultJson) => {
+        this.activeRequestIds.delete(request.requestId);
+        this.respond(worker, request.requestId, true, resultJson ?? "");
+      },
+      (error: unknown) => {
+        this.activeRequestIds.delete(request.requestId);
+        this.respond(
+          worker,
+          request.requestId,
+          false,
+          undefined,
+          sanitizeHostErrorMessage(getErrorMessage(error)),
+        );
+      },
+    );
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.abortController.abort();
+    this.activeRequestIds.clear();
+  }
+
+  private validate(request: JsExecToolRequest): string | undefined {
+    if (this.closed) return "tool request arrived after execution closed";
+    if (request.protocolToken !== this.protocolToken) {
+      return "invalid tool request protocol token";
+    }
+    if (this.seenRequestIds.has(request.requestId)) {
+      return "duplicate tool request ID";
+    }
+    if (!request.path || typeof request.path !== "string") {
+      return "invalid tool request path";
+    }
+    if (typeof request.argsJson !== "string") {
+      return "invalid tool request arguments";
+    }
+    return undefined;
+  }
+
+  private respond(
+    worker: Worker,
+    requestId: number,
+    success: boolean,
+    resultJson?: string,
+    error?: string,
+  ): void {
+    if (this.closed) return;
+    let response: JsExecToolResponse = {
+      protocolToken: this.protocolToken,
+      type: "tool-response",
+      requestId,
+      success,
+      resultJson,
+      error,
+    };
+    try {
+      this.controller.assertMessageSize(response, "response");
+    } catch (sizeError) {
+      response = {
+        protocolToken: this.protocolToken,
+        type: "tool-response",
+        requestId,
+        success: false,
+        error: sanitizeHostErrorMessage(getErrorMessage(sizeError)),
+      };
+    }
+    worker.postMessage(response);
+  }
+}
+
 type QueuedExecution = {
   input: JsExecWorkerInput;
   bridgeHandler: BridgeHandler;
   resolve: (result: JsExecWorkerOutput) => void;
   controller: WorkerRequestController;
+  toolRequests: ToolRequestOwner;
 };
 const executionQueue: QueuedExecution[] = [];
 let currentExecution: QueuedExecution | null = null;
@@ -236,6 +377,7 @@ function terminateOwnedWorker(
   // intentionally suppresses callbacks inherited from a deactivated execution;
   // resolving first would therefore strand currentExecution forever.
   owner.controller.close();
+  owner.toolRequests.close();
   let settled = false;
   const failClosed = (): void => {
     if (settled) return;
@@ -247,6 +389,7 @@ function terminateOwnedWorker(
     workerInitializationFailure = "worker termination was not acknowledged";
     for (const queued of executionQueue) {
       queued.bridgeHandler.stop();
+      queued.toolRequests.close();
       queued.resolve({ success: false, error: workerInitializationFailure });
     }
     executionQueue.length = 0;
@@ -279,8 +422,12 @@ export function _resetJsExecWorkerForTests(): void {
     workerIdleTimeout = null;
   }
   currentExecution?.bridgeHandler.stop();
+  currentExecution?.toolRequests.close();
   currentExecution = null;
-  for (const queued of executionQueue) queued.bridgeHandler.stop();
+  for (const queued of executionQueue) {
+    queued.bridgeHandler.stop();
+    queued.toolRequests.close();
+  }
   executionQueue.length = 0;
   const worker = sharedWorker;
   sharedWorker = null;
@@ -311,6 +458,7 @@ function processNextExecution(): void {
     // was posted. Settle the identity-owned entry and gate the next dispatch
     // on teardown of any worker that was partially created.
     next.bridgeHandler.stop();
+    next.toolRequests.close();
     const result: JsExecWorkerOutput = {
       success: false,
       error: sanitizeHostErrorMessage(getErrorMessage(error)),
@@ -396,9 +544,25 @@ function getOrCreateWorker(): Worker {
   const worker = DefenseInDepthBox.runTrusted(() => new Worker(workerPath));
   sharedWorker = worker;
 
-  worker.on("message", (msg: unknown) => {
+  worker.on("message", (msg: JsExecWorkerMessage) => {
     // Ignore stale workers that were superseded after timeout/restart.
     if (sharedWorker !== worker) {
+      return;
+    }
+    if (currentExecution && msg.type === "tool-request") {
+      try {
+        currentExecution.controller.assertMessageSize(msg, "request");
+        currentExecution.toolRequests.handle(msg, worker);
+      } catch (error) {
+        const owner = currentExecution;
+        const result: JsExecWorkerOutput = {
+          success: false,
+          error: sanitizeHostErrorMessage(getErrorMessage(error)),
+        };
+        owner.bridgeHandler.stop();
+        sharedWorker = null;
+        terminateOwnedWorker(owner, worker, result);
+      }
       return;
     }
     if (currentExecution) {
@@ -419,10 +583,12 @@ function getOrCreateWorker(): Worker {
         workerInitializationFailure =
           result.error ?? "Worker initialization failed";
         currentExecution.bridgeHandler.stop();
+        currentExecution.toolRequests.close();
         currentExecution.resolve(result);
         currentExecution = null;
         for (const queued of executionQueue) {
           queued.bridgeHandler.stop();
+          queued.toolRequests.close();
           queued.resolve({
             success: false,
             type: "initialization-failure",
@@ -434,6 +600,13 @@ function getOrCreateWorker(): Worker {
         void worker.terminate();
         return;
       }
+      if (currentExecution.toolRequests.hasActiveRequests) {
+        result = {
+          success: false,
+          error: "worker completed with active tool requests",
+        };
+      }
+      currentExecution.toolRequests.close();
       currentExecution.resolve(result);
       currentExecution = null;
     }
@@ -455,10 +628,12 @@ function getOrCreateWorker(): Worker {
         success: false,
         error: workerError,
       });
+      currentExecution.toolRequests.close();
       currentExecution = null;
     }
     // Reject all queued executions
     for (const queued of executionQueue) {
+      queued.toolRequests.close();
       queued.resolve({ success: false, error: "Worker crashed" });
     }
     executionQueue.length = 0;
@@ -471,6 +646,7 @@ function getOrCreateWorker(): Worker {
     }
     sharedWorker = null;
     if (currentExecution) {
+      currentExecution.toolRequests.close();
       currentExecution.resolve({
         success: false,
         error: "Worker exited unexpectedly",
@@ -534,6 +710,7 @@ async function queueAndRun(
   bridgeHandler: BridgeHandler,
   timeoutMs: number,
   controller: WorkerRequestController,
+  toolRequests: ToolRequestOwner,
 ): Promise<{
   bridgeOutput: import("../worker-bridge/bridge-handler.js").BridgeOutput;
   workerResult: JsExecWorkerOutput;
@@ -548,6 +725,7 @@ async function queueAndRun(
     bridgeHandler,
     resolve: () => {},
     controller,
+    toolRequests,
   };
   controller.assertMessageSize(
     { ...workerInput, sharedBuffer: undefined },
@@ -556,6 +734,7 @@ async function queueAndRun(
 
   const cancel = (reason: "abort" | "timeout"): void => {
     bridgeHandler.stop();
+    toolRequests.close();
     const result: JsExecWorkerOutput = {
       success: false,
       error:
@@ -582,6 +761,7 @@ async function queueAndRun(
   };
 
   queueEntry.resolve = (result: JsExecWorkerOutput) => {
+    queueEntry.toolRequests.close();
     queueEntry.controller.close();
     resolveWorker(result);
   };
@@ -596,6 +776,7 @@ async function queueAndRun(
       const index = executionQueue.indexOf(queueEntry);
       if (index !== -1) executionQueue.splice(index, 1);
       queueEntry.controller.close();
+      queueEntry.toolRequests.close();
       throw error;
     }
   }
@@ -651,7 +832,6 @@ async function executeJSInner(
     ctx.fetch,
     ctx.limits.maxOutputSize,
     wrappedExec,
-    ctx.invokeTool,
   );
 
   const timeoutMs = resolveTimeout(ctx);
@@ -661,6 +841,12 @@ async function executeJSInner(
     signal: ctx.signal,
     maxMessageBytes: ctx.limits.maxWorkerMessageBytes,
   });
+  const toolRequests = new ToolRequestOwner(
+    requestController.protocolToken,
+    ctx.invokeTool,
+    requestController,
+    ctx.limits.maxConcurrentJobs,
+  );
 
   const workerInput: JsExecWorkerInput = {
     protocolToken: requestController.protocolToken,
@@ -682,6 +868,7 @@ async function executeJSInner(
     bridgeHandler,
     timeoutMs,
     requestController,
+    toolRequests,
   );
 
   if (!workerResult.success && workerResult.error) {
@@ -778,13 +965,6 @@ export const jsExecCommand: RuntimeCommand = {
       if (scriptPath.endsWith(".ts") || scriptPath.endsWith(".mts")) {
         stripTypes = true;
       }
-    }
-
-    // Auto-detect top-level await → enable module mode
-    // Require await followed by identifier/call/bracket to reduce false positives
-    // from comments ("// await the result") and strings ("please await")
-    if (!isModule && /\bawait\s+[\w([`]/.test(jsCode)) {
-      isModule = true;
     }
 
     // Get bootstrap code from context (threaded via RuntimeCommandContext, not env)

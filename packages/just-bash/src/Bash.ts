@@ -81,6 +81,7 @@ import type {
   Command,
   CommandRegistry,
   FeatureCoverageWriter,
+  ToolInvoker,
   TraceCallback,
 } from "./types.js";
 
@@ -102,14 +103,15 @@ export interface JavaScriptConfig {
   bootstrap?: string;
   /**
    * Tool invocation hook. When provided, code running in `js-exec` gets a
-   * global `tools` proxy that routes calls through this callback synchronously
-   * (the worker blocks via `Atomics.wait` while the host resolves the call).
+   * global `tools` proxy whose calls return Promises. Multiple calls may be
+   * active concurrently and must be awaited by guest code.
    *
    * - `path`: dot-separated tool path (e.g. `"math.add"`). The proxy builds
    *   it from JS property access — `tools.math.add(...)` becomes `"math.add"`.
    * - `argsJson`: JSON-stringified args object, or empty string for no args.
+   * - `context.signal`: aborts when the owning `js-exec` request is canceled.
    * - return: JSON-stringified result, or empty string for `undefined`.
-   * - throw: propagates as a catchable exception inside the sandbox.
+   * - throw/reject: propagates as a catchable Promise rejection in the sandbox.
    *
    * Setting `invokeTool` implicitly enables `js-exec` (no separate
    * `javascript: true` needed). Pair with `customCommands` if you want the
@@ -117,7 +119,7 @@ export interface JavaScriptConfig {
    * `@just-bash/executor` produces a matching `invokeTool` + `commands` pair
    * from inline tools and/or `@executor-js/sdk` discovery.
    */
-  invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  invokeTool?: ToolInvoker;
 }
 
 export interface BashOptions {
@@ -318,7 +320,7 @@ export class Bash {
   private defenseInDepthConfig?: DefenseInDepthConfig | boolean;
   private coverageWriter?: FeatureCoverageWriter;
   private jsBootstrapCode?: string;
-  private invokeToolFn?: (path: string, argsJson: string) => Promise<string>;
+  private invokeToolFn?: ToolInvoker;
   // biome-ignore lint/suspicious/noExplicitAny: type-erased plugin storage for untyped API
   private transformPlugins: TransformPlugin<any>[] = [];
 
@@ -413,6 +415,7 @@ export class Bash {
       virtualGid: options.processInfo?.gid ?? 1000,
       bashPid: options.processInfo?.pid ?? 1, // BASHPID starts as virtual PID
       nextVirtualPid: (options.processInfo?.pid ?? 1) + 1, // Counter for unique subshell PIDs
+      virtualPidAllocator: { next: (options.processInfo?.pid ?? 1) + 1 },
       currentLine: 1, // $LINENO starts at 1
       options: {
         errexit: false,

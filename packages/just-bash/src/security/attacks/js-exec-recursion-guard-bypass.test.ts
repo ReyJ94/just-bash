@@ -176,7 +176,8 @@ console.log('NOWAIT_NERR=' + String(fs.existsSync(nestedErr) ? fs.readFileSync(n
 
       expect(result.stdout).toBe(
         [
-          "NOWAIT_STATUS=1",
+          // Background launch succeeds even though the guarded child fails.
+          "NOWAIT_STATUS=0",
           "NOWAIT_STDERR=",
           "NOWAIT_MARKER=false",
           "NOWAIT_NOUT=",
@@ -228,7 +229,8 @@ console.log('DELAY_NERR=' + String(fs.existsSync(nestedErr) ? fs.readFileSync(ne
 
       expect(result.stdout).toBe(
         [
-          "DELAY_STATUS=1",
+          // Background launch succeeds even though the guarded child fails.
+          "DELAY_STATUS=0",
           "DELAY_STDERR=",
           "DELAY_MARKER=false",
           "DELAY_NOUT=",

@@ -12,6 +12,17 @@ export interface FeatureCoverageWriter {
   hit(feature: string): void;
 }
 
+export interface ToolInvocationContext {
+  /** Aborted when the owning js-exec request times out, is canceled, or ends. */
+  readonly signal: AbortSignal;
+}
+
+export type ToolInvoker = (
+  path: string,
+  argsJson: string,
+  context?: ToolInvocationContext,
+) => Promise<string>;
+
 export interface ExecResult {
   stdout: string;
   stderr: string;
@@ -267,7 +278,7 @@ export interface RuntimeCommandContext {
    * routes calls through this callback. Receives `(path, argsJson)` and
    * returns a JSON result string.
    */
-  invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  invokeTool?: ToolInvoker;
 }
 
 /** Legacy standalone context shape used by direct command invocations. */
