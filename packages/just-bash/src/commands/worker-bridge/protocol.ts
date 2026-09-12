@@ -37,6 +37,8 @@ export const OpCode = {
   REALPATH: 13,
   RENAME: 14,
   COPY_FILE: 15,
+  READ_FILE_NEXT: 16,
+  READ_FILE_ABORT: 17,
   // Special operations for I/O
   WRITE_STDOUT: 100,
   WRITE_STDERR: 101,
@@ -55,6 +57,7 @@ export const Status = {
   READY: 1,
   SUCCESS: 2,
   ERROR: 3,
+  CLOSED: 4,
 } as const;
 
 export type StatusType = (typeof Status)[keyof typeof Status];
@@ -86,19 +89,21 @@ const Offset = {
   ERROR_CODE: 20,
   FLAGS: 24,
   MODE: 28,
-  PATH_BUFFER: 32,
-  DATA_BUFFER: 4128, // 32 + 4096
+  READ_TOTAL_LENGTH: 32,
+  READ_OFFSET: 40,
+  PATH_BUFFER: 48,
+  DATA_BUFFER: 4144, // 48 + 4096
 } as const;
 
 /** Buffer sizes */
 const Size = {
-  CONTROL_REGION: 32,
+  CONTROL_REGION: 48,
   PATH_BUFFER: 4096,
-  // 8MB limit for FS read/write, HTTP responses, and tool invocation results.
+  // Reusable scratch for file reads; other operation payloads must fit once.
   // Sized to handle typical OpenAPI/GraphQL responses (paginated lists, batch queries).
   // Still well under the 64MB QuickJS memory limit per execution.
   DATA_BUFFER: 8388608,
-  TOTAL: 8392736, // 32 + 4096 + 8MB
+  TOTAL: 8392752, // 48 + 4096 + 8MB
 } as const;
 
 /** Flags for operations */
@@ -208,6 +213,40 @@ export class ProtocolBuffer {
 
   setMode(mode: number): void {
     _Atomics.store(this.int32View, Offset.MODE / 4, mode);
+  }
+
+  private readLength(offset: number): number {
+    const length = this.dataView.getFloat64(offset, true);
+    this.validateReadLength(length);
+    return length;
+  }
+
+  private validateReadLength(length: number): void {
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new Error("Invalid file read length or offset");
+    }
+  }
+
+  getReadTotalLength(): number {
+    return this.readLength(Offset.READ_TOTAL_LENGTH);
+  }
+
+  setReadTotalLength(length: number): void {
+    this.validateReadLength(length);
+    this.dataView.setFloat64(Offset.READ_TOTAL_LENGTH, length, true);
+  }
+
+  getReadOffset(): number {
+    return this.readLength(Offset.READ_OFFSET);
+  }
+
+  setReadOffset(offset: number): void {
+    this.validateReadLength(offset);
+    this.dataView.setFloat64(Offset.READ_OFFSET, offset, true);
+  }
+
+  getResultCapacity(): number {
+    return Size.DATA_BUFFER;
   }
 
   getPath(): string {
@@ -367,6 +406,7 @@ export class ProtocolBuffer {
 
     while (true) {
       const status = this.getStatus();
+      if (status === Status.CLOSED) return false;
       if (status === Status.READY) {
         return true;
       }
@@ -404,6 +444,15 @@ export class ProtocolBuffer {
     );
   }
 
+  waitForResultAsync(): ReturnType<typeof _Atomics.waitAsync> {
+    return _Atomics.waitAsync(this.int32View, Offset.STATUS / 4, Status.READY);
+  }
+
+  close(): void {
+    this.setStatus(Status.CLOSED);
+    this.notify();
+  }
+
   notify(): number {
     return _Atomics.notify(this.int32View, Offset.STATUS / 4);
   }
@@ -417,5 +466,7 @@ export class ProtocolBuffer {
     this.setErrorCode(ErrorCode.NONE);
     this.setFlags(Flags.NONE);
     this.setMode(0);
+    this.setReadTotalLength(0);
+    this.setReadOffset(0);
   }
 }

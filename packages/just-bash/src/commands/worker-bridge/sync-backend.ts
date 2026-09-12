@@ -5,6 +5,7 @@
  * via SharedArrayBuffer + Atomics.
  */
 
+import { _performanceNow } from "../../security/trusted-globals.js";
 import {
   Flags,
   OpCode,
@@ -19,6 +20,7 @@ import {
 export class SyncBackend {
   private protocol: ProtocolBuffer;
   private operationTimeoutMs: number;
+  private closed = false;
 
   constructor(sharedBuffer: SharedArrayBuffer, operationTimeoutMs = 30000) {
     this.protocol = new ProtocolBuffer(sharedBuffer);
@@ -31,12 +33,26 @@ export class SyncBackend {
     data?: Uint8Array,
     flags = 0,
     mode = 0,
+    deadline = _performanceNow() + this.operationTimeoutMs,
+    read?: { offset: number; total: number },
   ): { success: boolean; result?: Uint8Array; error?: string } {
+    if (this.closed || this.protocol.getStatus() === Status.CLOSED) {
+      return { success: false, error: "Bridge is closed" };
+    }
+    const remaining = deadline - _performanceNow();
+    if (remaining <= 0) {
+      this.close();
+      return { success: false, error: "Operation timed out" };
+    }
     this.protocol.reset();
     this.protocol.setOpCode(opCode);
     this.protocol.setPath(path);
     this.protocol.setFlags(flags);
     this.protocol.setMode(mode);
+    if (read) {
+      this.protocol.setReadOffset(read.offset);
+      this.protocol.setReadTotalLength(read.total);
+    }
     if (data) {
       this.protocol.setData(data);
     }
@@ -45,14 +61,23 @@ export class SyncBackend {
     this.protocol.notify();
 
     // Wait for main thread to process (with timeout)
-    const waitResult = this.protocol.waitForResult(this.operationTimeoutMs);
+    const waitResult = this.protocol.waitForResult(remaining);
     if (waitResult === "timed-out") {
+      this.close();
       return { success: false, error: "Operation timed out" };
     }
 
     const status = this.protocol.getStatus();
     if (status === Status.SUCCESS) {
+      // File piece copying/allocation belongs inside readFile's abort boundary.
+      if (opCode === OpCode.READ_FILE || opCode === OpCode.READ_FILE_NEXT) {
+        return { success: true };
+      }
       return { success: true, result: this.protocol.getResult() };
+    }
+    if (status !== Status.ERROR) {
+      this.close();
+      return { success: false, error: "Bridge is closed" };
     }
     return {
       success: false,
@@ -62,12 +87,71 @@ export class SyncBackend {
     };
   }
 
+  private close(): void {
+    this.closed = true;
+    this.protocol.close();
+  }
+
   readFile(path: string): Uint8Array {
-    const result = this.execSync(OpCode.READ_FILE, path);
-    if (!result.success) {
-      throw new Error(result.error || "Failed to read file");
+    const deadline = _performanceNow() + this.operationTimeoutMs;
+    let began = false;
+    try {
+      const first = this.execSync(
+        OpCode.READ_FILE,
+        path,
+        undefined,
+        0,
+        0,
+        deadline,
+      );
+      if (!first.success) throw new Error(first.error || "Failed to read file");
+      began = true;
+      const total = this.protocol.getReadTotalLength();
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      while (true) {
+        const length = this.protocol.getResultLength();
+        if (
+          this.protocol.getReadTotalLength() !== total ||
+          length < 0 ||
+          length > this.protocol.getResultCapacity() ||
+          length > total - offset ||
+          (length === 0 && offset < total)
+        ) {
+          throw new Error("Invalid file read piece");
+        }
+        bytes.set(this.protocol.getResult(), offset);
+        offset += length;
+        if (offset === total) return bytes;
+        const next = this.execSync(
+          OpCode.READ_FILE_NEXT,
+          "",
+          undefined,
+          0,
+          0,
+          deadline,
+          { offset, total },
+        );
+        if (!next.success) throw new Error(next.error || "Failed to read file");
+      }
+    } catch (error) {
+      if (began && !this.closed) {
+        try {
+          const aborted = this.execSync(
+            OpCode.READ_FILE_ABORT,
+            "",
+            undefined,
+            0,
+            0,
+            deadline,
+          );
+          if (!aborted.success) this.close();
+        } catch {
+          this.close();
+        }
+      }
+      throw error;
     }
-    return result.result ?? new Uint8Array(0);
   }
 
   writeFile(path: string, data: Uint8Array): void {

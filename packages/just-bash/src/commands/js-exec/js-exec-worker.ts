@@ -102,9 +102,6 @@ async function getQuickJSModule(): Promise<QuickJSWASMModule> {
 /** QuickJS memory limit: 64MB */
 const MEMORY_LIMIT = 64 * 1024 * 1024;
 
-/** Maximum execution cycles before interrupt check */
-const INTERRUPT_CYCLES = 100000;
-
 const PROCESS_EXIT_MARKER = "__just_bash_process_exit_marker__";
 
 interface PendingToolCall {
@@ -1327,16 +1324,6 @@ async function executeCode(
   try {
     runtime = qjs.newRuntime();
     runtime.setMemoryLimit(MEMORY_LIMIT);
-
-    // Set up interrupt handler for infinite loop protection.
-    // This is a loose backstop — timeouts (via worker termination) are the real
-    // guard against runaway code. The interrupt handler just provides a faster
-    // exit path for tight CPU-bound loops that don't yield to the event loop.
-    let interruptCount = 0;
-    runtime.setInterruptHandler(() => {
-      interruptCount++;
-      return interruptCount > INTERRUPT_CYCLES;
-    });
 
     context = runtime.newContext();
     processExitMarker = context.newObject();

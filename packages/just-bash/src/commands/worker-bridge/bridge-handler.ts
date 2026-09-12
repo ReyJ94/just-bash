@@ -38,6 +38,8 @@ export class BridgeHandler {
   private outputLimitExceeded = false;
   private startTime = 0;
   private timeoutMs = 0;
+  private readSnapshot: { bytes: Uint8Array; offset: number } | undefined;
+  private stopRead: (() => void) | undefined;
 
   constructor(
     sharedBuffer: SharedArrayBuffer,
@@ -102,47 +104,62 @@ export class BridgeHandler {
     this.startTime = Date.now();
     this.timeoutMs = timeoutMs;
 
-    while (this.running) {
-      const elapsed = Date.now() - this.startTime;
-      if (elapsed >= timeoutMs) {
-        this.output.stderr += `\n${this.commandName}: execution timeout exceeded\n`;
-        this.output.exitCode = 124;
-        break;
+    try {
+      while (this.running) {
+        const elapsed = Date.now() - this.startTime;
+        if (elapsed >= timeoutMs) {
+          this.output.stderr += `\n${this.commandName}: execution timeout exceeded\n`;
+          this.output.exitCode = 124;
+          break;
+        }
+
+        // Wait for worker to set status to READY
+        const remainingMs = this.remainingMs();
+        const ready = await this.protocol.waitUntilReady(remainingMs);
+        if (!ready) {
+          if (!this.running || this.protocol.getStatus() === Status.CLOSED)
+            break;
+          this.output.stderr += `\n${this.commandName}: execution timeout exceeded\n`;
+          this.output.exitCode = 124;
+          break;
+        }
+        if (!this.running) break;
+
+        const opCode = this.protocol.getOpCode();
+        await this.handleOperation(opCode);
+
+        // handleOperation sets status to SUCCESS/ERROR
+        // Notify worker so it wakes up and sees the result
+        this.protocol.notify();
       }
-
-      // Wait for worker to set status to READY
-      const remainingMs = this.remainingMs();
-      const ready = await this.protocol.waitUntilReady(remainingMs);
-      if (!ready) {
-        this.output.stderr += `\n${this.commandName}: execution timeout exceeded\n`;
-        this.output.exitCode = 124;
-        break;
-      }
-      if (!this.running) break;
-
-      const opCode = this.protocol.getOpCode();
-      await this.handleOperation(opCode);
-
-      // handleOperation sets status to SUCCESS/ERROR
-      // Notify worker so it wakes up and sees the result
-      this.protocol.notify();
+    } finally {
+      this.running = false;
+      this.readSnapshot = undefined;
+      this.stopRead?.();
     }
-
     return this.output;
   }
 
   stop(): void {
     this.running = false;
-    // Wake a handler blocked before the worker's first bridge operation.
-    this.protocol.setStatus(Status.READY);
-    this.protocol.notify();
+    this.readSnapshot = undefined;
+    this.stopRead?.();
+    // Wake both an idle handler and a worker waiting on an abandoned exchange.
+    this.protocol.close();
   }
 
   private async handleOperation(opCode: OpCodeType): Promise<void> {
+    if (opCode !== OpCode.READ_FILE_NEXT) this.readSnapshot = undefined;
     try {
       switch (opCode) {
         case OpCode.READ_FILE:
           await this.handleReadFile();
+          break;
+        case OpCode.READ_FILE_NEXT:
+          this.handleReadNext();
+          break;
+        case OpCode.READ_FILE_ABORT:
+          this.protocol.setStatus(Status.SUCCESS);
           break;
         case OpCode.WRITE_FILE:
           await this.handleWriteFile();
@@ -206,7 +223,9 @@ export class BridgeHandler {
           this.protocol.setStatus(Status.ERROR);
       }
     } catch (e) {
-      this.setErrorFromException(e);
+      this.readSnapshot = undefined;
+      if (this.protocol.getStatus() !== Status.CLOSED)
+        this.setErrorFromException(e);
     }
   }
 
@@ -216,13 +235,66 @@ export class BridgeHandler {
 
   private async handleReadFile(): Promise<void> {
     const path = this.resolvePath(this.protocol.getPath());
-    try {
-      const content = await this.fs.readFileBuffer(path);
-      this.protocol.setResult(content);
-      this.protocol.setStatus(Status.SUCCESS);
-    } catch (e) {
-      this.setErrorFromException(e);
+    const content = await this.raceDeadline(() => this.readUntilClosed(path));
+    if (!this.running || this.protocol.getStatus() === Status.CLOSED) return;
+    // Some FS implementations return a mutable alias. Own this read's version.
+    this.readSnapshot = { bytes: new Uint8Array(content), offset: 0 };
+    this.publishReadPiece();
+  }
+
+  private readUntilClosed(path: string): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (
+        result: { bytes: Uint8Array } | { error: unknown },
+      ): void => {
+        if (settled) return;
+        settled = true;
+        this.stopRead = undefined;
+        if ("bytes" in result) resolve(result.bytes);
+        else reject(result.error);
+      };
+      this.stopRead = () => finish({ error: new Error("Bridge is closed") });
+      this.fs.readFileBuffer(path).then(
+        (bytes) => finish({ bytes }),
+        (error) => finish({ error }),
+      );
+      // A synchronous worker timeout closes the shared exchange. Also wake on
+      // normal response publication so a completed read leaves no waiter behind.
+      void (async () => {
+        while (!settled && this.protocol.getStatus() === Status.READY) {
+          const wait = this.protocol.waitForResultAsync();
+          if (wait.async) await wait.value;
+        }
+        if (this.protocol.getStatus() === Status.CLOSED) this.stopRead?.();
+      })();
+    });
+  }
+
+  private handleReadNext(): void {
+    const snapshot = this.readSnapshot;
+    if (
+      !snapshot ||
+      this.protocol.getReadOffset() !== snapshot.offset ||
+      this.protocol.getReadTotalLength() !== snapshot.bytes.byteLength
+    ) {
+      throw new Error("Invalid file read continuation");
     }
+    this.publishReadPiece();
+  }
+
+  private publishReadPiece(): void {
+    const snapshot = this.readSnapshot;
+    if (!snapshot) throw new Error("No active file read");
+    const end = Math.min(
+      snapshot.bytes.byteLength,
+      snapshot.offset + this.protocol.getResultCapacity(),
+    );
+    this.protocol.setReadTotalLength(snapshot.bytes.byteLength);
+    this.protocol.setResult(snapshot.bytes.subarray(snapshot.offset, end));
+    snapshot.offset = end;
+    if (end === snapshot.bytes.byteLength) this.readSnapshot = undefined;
+    this.protocol.setStatus(Status.SUCCESS);
   }
 
   private async handleWriteFile(): Promise<void> {
